@@ -1,9 +1,38 @@
 import { WasmBridge } from '@/upstream/core';
 import type { DocumentInfo } from '@/upstream/core';
+import { showHwpPasswordDialog } from '@/upstream/ui';
 import { remove, stat } from '@tauri-apps/plugin-fs';
 import { finiteFileSize, readFileInChunks, writeFileInChunks } from './chunked-fs';
 
 type DocumentFormat = 'hwp' | 'hwpx';
+
+// rhwp가 던지는 오류 메시지의 부분 문자열이다. upstream rhwp-studio의 main.ts가 같은 문자열로
+// 암호 필요/오답을 판별하므로 그 정책을 그대로 따른다 (golbin/hop#98).
+const PASSWORD_REQUIRED_MESSAGE = '비밀번호가 필요한 암호 문서';
+const PASSWORD_REJECTED_MESSAGE = '비밀번호가 일치하지 않거나 암호화 데이터가 손상되었습니다';
+
+function isPasswordRequiredError(error: unknown): boolean {
+  return String(error).includes(PASSWORD_REQUIRED_MESSAGE);
+}
+
+function isPasswordRejectedError(error: unknown): boolean {
+  return String(error).includes(PASSWORD_REJECTED_MESSAGE);
+}
+
+/**
+ * 오입력과 암호문 손상은 암호학적으로 구분할 수 없고, 원본 오류에는 사용자가 입력한 내용이 섞여
+ * 들어올 수 있다. 그래서 화면에는 안전한 일반 안내만 노출한다 (upstream main.ts와 동일 정책).
+ */
+function passwordOpenFailure(error: unknown): Error {
+  const message = String(error);
+  if (message.includes('지원하지 않는 암호화 방식')) {
+    return new Error('지원하지 않는 암호화 방식의 문서입니다. 지원되는 HWP3/HWP5 암호 문서만 열 수 있습니다.');
+  }
+  if (message.includes('DRM')) {
+    return new Error('DRM으로 보호된 문서는 지원하지 않습니다.');
+  }
+  return new Error('암호화된 문서를 열 수 없습니다. 문서가 손상되었는지 확인하세요.');
+}
 
 interface NativeOpenResult {
   docId: string;
@@ -121,7 +150,12 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
     });
     const previousDocId = this.docId;
     try {
-      const info = super.loadDocument(bytes, result.fileName);
+      const info = await this.loadDocumentForOpen(bytes, result.fileName);
+      if (!info) {
+        // 사용자가 암호 입력 대화상자를 취소했다. 새로 등록된 네이티브 문서만 정리한다.
+        await this.closeNativeDocument(result.docId);
+        return null;
+      }
       this.applyNativeOpenResult(result, this.normalizedSourceFormat(super.getSourceFormat()));
       await this.noteFinderRecentDocument(path);
       await this.recordRecentDocument(path);
@@ -133,6 +167,40 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
     } catch (error) {
       await this.closeNativeDocument(result.docId);
       throw error;
+    }
+  }
+
+  /**
+   * 일반 열기를 먼저 시도하고, 비밀번호가 필요한 문서로 판별된 경우에만 암호 입력 UI로
+   * 전환한다 (golbin/hop#98). rhwp-studio 자체(config/rhwp-studio-overrides.json에 없는
+   * main.ts)에는 이미 이 흐름이 구현돼 있지만, HOP은 저수준 loadDocument()를 직접 호출하는
+   * 이 파일에서 그 흐름을 거치지 않아 암호 문서를 열 수 없었다.
+   */
+  private async loadDocumentForOpen(bytes: Uint8Array, fileName: string): Promise<DocumentInfo | null> {
+    try {
+      return super.loadDocument(bytes, fileName);
+    } catch (error) {
+      if (!isPasswordRequiredError(error)) throw error;
+      return this.loadPasswordProtectedDocument(bytes, fileName);
+    }
+  }
+
+  private async loadPasswordProtectedDocument(bytes: Uint8Array, fileName: string): Promise<DocumentInfo | null> {
+    let retryMessage: string | undefined;
+
+    while (true) {
+      const password = await showHwpPasswordDialog(fileName, retryMessage);
+      if (password === null) return null;
+
+      try {
+        return super.loadDocumentWithPassword(bytes, password, fileName);
+      } catch (error) {
+        if (isPasswordRejectedError(error)) {
+          retryMessage = '암호가 일치하지 않거나 문서가 손상되었습니다. 다시 입력하세요.';
+          continue;
+        }
+        throw passwordOpenFailure(error);
+      }
     }
   }
 

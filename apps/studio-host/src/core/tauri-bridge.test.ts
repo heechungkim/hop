@@ -9,6 +9,7 @@ const messageMock = vi.hoisted(() => vi.fn());
 const fsOpenMock = vi.hoisted(() => vi.fn());
 const statMock = vi.hoisted(() => vi.fn());
 const removeMock = vi.hoisted(() => vi.fn());
+const passwordDialogMock = vi.hoisted(() => vi.fn());
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: invokeMock,
@@ -26,10 +27,18 @@ vi.mock('@tauri-apps/plugin-fs', () => ({
   remove: removeMock,
 }));
 
+vi.mock('@/ui/hwp-password-dialog', () => ({
+  showHwpPasswordDialog: passwordDialogMock,
+}));
+
 vi.mock('@/core/wasm-bridge', () => ({
   WasmBridge: class {
     fileName = 'document.hwp';
     loadDocumentMock = vi.fn((_bytes: Uint8Array, fileName: string) => ({
+      pageCount: fileName.endsWith('.hwpx') ? 3 : 2,
+      fontsUsed: [],
+    }));
+    loadDocumentWithPasswordMock = vi.fn((_bytes: Uint8Array, _password: string, fileName: string) => ({
       pageCount: fileName.endsWith('.hwpx') ? 3 : 2,
       fontsUsed: [],
     }));
@@ -40,6 +49,11 @@ vi.mock('@/core/wasm-bridge', () => ({
     loadDocument(bytes: Uint8Array, fileName: string) {
       this.sourceFormat = fileName.endsWith('.hwpx') || bytes[0] === 0x50 ? 'hwpx' : 'hwp';
       return this.loadDocumentMock(bytes, fileName);
+    }
+
+    loadDocumentWithPassword(bytes: Uint8Array, password: string, fileName: string) {
+      this.sourceFormat = fileName.endsWith('.hwpx') || bytes[0] === 0x50 ? 'hwpx' : 'hwp';
+      return this.loadDocumentWithPasswordMock(bytes, password, fileName);
     }
 
     createNewDocument() {
@@ -205,6 +219,111 @@ describe('TauriBridge', () => {
       filters: [{ name: 'HWP/HWPX 문서', extensions: ['hwp', 'hwpx'] }],
     });
     expect(loaded?.message).toBe('dialog.hwpx — 3페이지');
+  });
+
+  it('prompts for a password and opens the document once the correct password is entered', async () => {
+    const bridge = new TauriBridge();
+    fsOpenMock.mockResolvedValue(readHandle([1, 2, 3]));
+    invokeMock.mockResolvedValue(nativeOpenResult({
+      docId: 'secret-doc',
+      fileName: 'secret.hwp',
+      sourcePath: '/tmp/secret.hwp',
+    }));
+    getWasmMock(bridge, 'loadDocumentMock').mockImplementationOnce(() => {
+      throw new Error(
+        '유효하지 않은 파일: 비밀번호가 필요한 암호 문서입니다 (parse_document_with_password 또는 parse_hwp_with_password 로 비밀번호를 전달하세요)',
+      );
+    });
+    passwordDialogMock.mockResolvedValueOnce('correct-password');
+
+    const loaded = await bridge.openDocumentByPath('/tmp/secret.hwp');
+
+    expect(passwordDialogMock).toHaveBeenCalledWith('secret.hwp', undefined);
+    expect(getWasmMock(bridge, 'loadDocumentWithPasswordMock')).toHaveBeenCalledWith(
+      new Uint8Array([1, 2, 3]),
+      'correct-password',
+      'secret.hwp',
+    );
+    expect(loaded?.message).toBe('secret.hwp — 2페이지');
+    expect(invokeMock).not.toHaveBeenCalledWith('close_document', expect.anything());
+  });
+
+  it('re-prompts with a retry message after a wrong password, then opens on the next attempt', async () => {
+    const bridge = new TauriBridge();
+    fsOpenMock.mockResolvedValue(readHandle([1, 2, 3]));
+    invokeMock.mockResolvedValue(nativeOpenResult({
+      docId: 'secret-doc',
+      fileName: 'secret.hwp',
+      sourcePath: '/tmp/secret.hwp',
+    }));
+    getWasmMock(bridge, 'loadDocumentMock').mockImplementationOnce(() => {
+      throw new Error('유효하지 않은 파일: 비밀번호가 필요한 암호 문서입니다');
+    });
+    getWasmMock(bridge, 'loadDocumentWithPasswordMock')
+      .mockImplementationOnce(() => {
+        throw new Error('비밀번호가 일치하지 않거나 암호화 데이터가 손상되었습니다');
+      });
+    passwordDialogMock
+      .mockResolvedValueOnce('wrong-password')
+      .mockResolvedValueOnce('correct-password');
+
+    const loaded = await bridge.openDocumentByPath('/tmp/secret.hwp');
+
+    expect(passwordDialogMock).toHaveBeenNthCalledWith(1, 'secret.hwp', undefined);
+    expect(passwordDialogMock).toHaveBeenNthCalledWith(
+      2,
+      'secret.hwp',
+      '암호가 일치하지 않거나 문서가 손상되었습니다. 다시 입력하세요.',
+    );
+    expect(loaded?.message).toBe('secret.hwp — 2페이지');
+  });
+
+  it('returns null and cleans up the native document when the password prompt is cancelled', async () => {
+    const bridge = new TauriBridge();
+    fsOpenMock.mockResolvedValue(readHandle([1, 2, 3]));
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === 'prepare_document_open') return undefined;
+      if (command === 'open_document_tracking') {
+        return nativeOpenResult({ docId: 'secret-doc', fileName: 'secret.hwp' });
+      }
+      if (command === 'close_document') return undefined;
+      throw new Error(`unexpected command ${command}`);
+    });
+    getWasmMock(bridge, 'loadDocumentMock').mockImplementationOnce(() => {
+      throw new Error('유효하지 않은 파일: 비밀번호가 필요한 암호 문서입니다');
+    });
+    passwordDialogMock.mockResolvedValueOnce(null);
+
+    const loaded = await bridge.openDocumentByPath('/tmp/secret.hwp');
+
+    expect(loaded).toBeNull();
+    expect(invokeMock).toHaveBeenCalledWith('close_document', { docId: 'secret-doc' });
+  });
+
+  it('surfaces a safe error message and cleans up when the document uses unsupported DRM', async () => {
+    const bridge = new TauriBridge();
+    fsOpenMock.mockResolvedValue(readHandle([1, 2, 3]));
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === 'prepare_document_open') return undefined;
+      if (command === 'open_document_tracking') {
+        return nativeOpenResult({ docId: 'drm-doc', fileName: 'drm.hwp' });
+      }
+      if (command === 'close_document') return undefined;
+      throw new Error(`unexpected command ${command}`);
+    });
+    getWasmMock(bridge, 'loadDocumentMock').mockImplementationOnce(() => {
+      throw new Error('유효하지 않은 파일: 비밀번호가 필요한 암호 문서입니다');
+    });
+    getWasmMock(bridge, 'loadDocumentWithPasswordMock').mockImplementationOnce(() => {
+      throw new Error('DRM으로 보호된 문서입니다');
+    });
+    passwordDialogMock.mockResolvedValueOnce('any-password');
+
+    await expect(bridge.openDocumentByPath('/tmp/drm.hwp')).rejects.toThrow(
+      'DRM으로 보호된 문서는 지원하지 않습니다.',
+    );
+
+    expect(invokeMock).toHaveBeenCalledWith('close_document', { docId: 'drm-doc' });
   });
 
   it('creates a new native document and releases it if wasm creation fails', async () => {
@@ -682,6 +801,9 @@ function nativeOpenResult(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function getWasmMock(bridge: TauriBridge, name: 'loadDocumentMock' | 'createNewDocumentMock' | 'exportHwpMock') {
+function getWasmMock(
+  bridge: TauriBridge,
+  name: 'loadDocumentMock' | 'loadDocumentWithPasswordMock' | 'createNewDocumentMock' | 'exportHwpMock',
+) {
   return (bridge as unknown as Record<typeof name, ReturnType<typeof vi.fn>>)[name];
 }
