@@ -11,7 +11,7 @@ const statMock = vi.hoisted(() => vi.fn());
 const removeMock = vi.hoisted(() => vi.fn());
 const passwordDialogMock = vi.hoisted(() => vi.fn());
 const savePasswordDialogMock = vi.hoisted(() => vi.fn());
-const shouldEncryptNewSavesMock = vi.hoisted(() => vi.fn(() => false));
+const hwpDocumentOpenWithPasswordMock = vi.hoisted(() => vi.fn(() => ({ free: vi.fn() })));
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: invokeMock,
@@ -34,8 +34,10 @@ vi.mock('@/ui/hwp-password-dialog', () => ({
   showHwpSavePasswordDialog: savePasswordDialogMock,
 }));
 
-vi.mock('./save-password-preference', () => ({
-  shouldEncryptNewSaves: shouldEncryptNewSavesMock,
+vi.mock('@wasm/rhwp.js', () => ({
+  HwpDocument: {
+    openWithPassword: hwpDocumentOpenWithPasswordMock,
+  },
 }));
 
 vi.mock('@/core/wasm-bridge', () => ({
@@ -89,7 +91,6 @@ describe('TauriBridge', () => {
     (globalThis as { document?: { title: string } }).document = { title: '' };
     statMock.mockResolvedValue({ size: 3, isFile: true, mtime: new Date('2026-04-23T00:00:00.000Z') });
     removeMock.mockResolvedValue(undefined);
-    shouldEncryptNewSavesMock.mockReturnValue(false);
   });
 
   it('opens a native document by path, mirrors bytes into wasm, and updates title state', async () => {
@@ -340,18 +341,7 @@ describe('TauriBridge', () => {
     expect(invokeMock).toHaveBeenCalledWith('close_document', { docId: 'drm-doc' });
   });
 
-  it('requires a save password for a newly opened plain document when the "encrypt new saves" preference is on', async () => {
-    const bridge = new TauriBridge();
-    fsOpenMock.mockResolvedValue(readHandle([1, 2, 3]));
-    invokeMock.mockResolvedValue(nativeOpenResult({ docId: 'plain-doc', fileName: 'plain.hwp' }));
-    shouldEncryptNewSavesMock.mockReturnValue(true);
-
-    await bridge.openDocumentByPath('/tmp/plain.hwp');
-
-    expect(getRequiresPasswordForSave(bridge)).toBe(true);
-  });
-
-  it('does not require a save password for a newly opened document when the preference is off', async () => {
+  it('does not require a save password for a newly opened plain document', async () => {
     const bridge = new TauriBridge();
     fsOpenMock.mockResolvedValue(readHandle([1, 2, 3]));
     invokeMock.mockResolvedValue(nativeOpenResult({ docId: 'plain-doc', fileName: 'plain.hwp' }));
@@ -361,17 +351,16 @@ describe('TauriBridge', () => {
     expect(getRequiresPasswordForSave(bridge)).toBe(false);
   });
 
-  it('requires a save password for a newly created document when the "encrypt new saves" preference is on', async () => {
+  it('does not require a save password for a newly created document', async () => {
     const bridge = new TauriBridge();
     invokeMock.mockImplementation(async (command: string) => {
       if (command === 'create_document') return nativeOpenResult({ docId: 'new-doc' });
       throw new Error(`unexpected command ${command}`);
     });
-    shouldEncryptNewSavesMock.mockReturnValue(true);
 
     await bridge.createNewDocumentAsync();
 
-    expect(getRequiresPasswordForSave(bridge)).toBe(true);
+    expect(getRequiresPasswordForSave(bridge)).toBe(false);
   });
 
   it('re-encrypts on save a document that was opened with a password', async () => {
@@ -457,6 +446,159 @@ describe('TauriBridge', () => {
     expect(result).toBeNull();
     expect(invokeMock).not.toHaveBeenCalledWith('commit_staged_hwp_save', expect.anything());
     expect(getWasmMock(bridge, 'exportHwpWithPasswordMock')).not.toHaveBeenCalled();
+  });
+
+  it('reports whether the current document is password protected', async () => {
+    const bridge = new TauriBridge();
+    expect(bridge.isCurrentDocumentPasswordProtected()).toBe(false);
+
+    applyOpenResult(bridge, {
+      docId: 'doc-1',
+      fileName: 'secret.hwp',
+      sourcePath: '/tmp/secret.hwp',
+      format: 'hwp',
+      pageCount: 1,
+      revision: 1,
+      dirty: false,
+      warnings: [],
+    });
+    bridge.enableCurrentDocumentPasswordProtection();
+
+    expect(bridge.isCurrentDocumentPasswordProtected()).toBe(true);
+  });
+
+  it('marks the document dirty when password protection is turned on', async () => {
+    const bridge = new TauriBridge();
+    invokeMock.mockResolvedValue(undefined);
+    applyOpenResult(bridge, {
+      docId: 'doc-1',
+      fileName: 'plain.hwp',
+      sourcePath: '/tmp/plain.hwp',
+      format: 'hwp',
+      pageCount: 1,
+      revision: 1,
+      dirty: false,
+      warnings: [],
+    });
+
+    bridge.enableCurrentDocumentPasswordProtection();
+
+    expect(bridge.hasUnsavedChanges()).toBe(true);
+    await vi.waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('mark_document_dirty', { docId: 'doc-1' });
+    });
+  });
+
+  it('removes password protection immediately for a document that was never saved', async () => {
+    const bridge = new TauriBridge();
+    invokeMock.mockResolvedValue(undefined);
+    applyOpenResult(bridge, {
+      docId: 'doc-1',
+      fileName: '새 문서.hwp',
+      sourcePath: null,
+      format: 'hwp',
+      pageCount: 1,
+      revision: 1,
+      dirty: false,
+      warnings: [],
+    });
+    bridge.enableCurrentDocumentPasswordProtection();
+
+    const result = await bridge.disableCurrentDocumentPasswordProtection('anything');
+
+    expect(result).toBe('removed');
+    expect(bridge.isCurrentDocumentPasswordProtected()).toBe(false);
+    expect(fsOpenMock).not.toHaveBeenCalled();
+  });
+
+  it('removes password protection after verifying the password against the saved file', async () => {
+    const bridge = new TauriBridge();
+    invokeMock.mockResolvedValue(undefined);
+    fsOpenMock.mockResolvedValue(readHandle([4, 5, 6]));
+    applyOpenResult(bridge, {
+      docId: 'doc-1',
+      fileName: 'secret.hwp',
+      sourcePath: '/tmp/secret.hwp',
+      format: 'hwp',
+      pageCount: 1,
+      revision: 1,
+      dirty: false,
+      warnings: [],
+    });
+    bridge.enableCurrentDocumentPasswordProtection();
+
+    const result = await bridge.disableCurrentDocumentPasswordProtection('correct-password');
+
+    expect(hwpDocumentOpenWithPasswordMock).toHaveBeenCalledWith(new Uint8Array([4, 5, 6]), 'correct-password');
+    expect(result).toBe('removed');
+    expect(bridge.isCurrentDocumentPasswordProtected()).toBe(false);
+  });
+
+  it('frees the throwaway probe document used to verify the password', async () => {
+    const bridge = new TauriBridge();
+    invokeMock.mockResolvedValue(undefined);
+    fsOpenMock.mockResolvedValue(readHandle([4, 5, 6]));
+    const freeMock = vi.fn();
+    hwpDocumentOpenWithPasswordMock.mockReturnValueOnce({ free: freeMock });
+    applyOpenResult(bridge, {
+      docId: 'doc-1',
+      fileName: 'secret.hwp',
+      sourcePath: '/tmp/secret.hwp',
+      format: 'hwp',
+      pageCount: 1,
+      revision: 1,
+      dirty: false,
+      warnings: [],
+    });
+    bridge.enableCurrentDocumentPasswordProtection();
+
+    await bridge.disableCurrentDocumentPasswordProtection('correct-password');
+
+    expect(freeMock).toHaveBeenCalled();
+  });
+
+  it('keeps password protection on and reports "wrong-password" for an incorrect password', async () => {
+    const bridge = new TauriBridge();
+    invokeMock.mockResolvedValue(undefined);
+    fsOpenMock.mockResolvedValue(readHandle([4, 5, 6]));
+    hwpDocumentOpenWithPasswordMock.mockImplementationOnce(() => {
+      throw new Error('비밀번호가 일치하지 않거나 암호화 데이터가 손상되었습니다');
+    });
+    applyOpenResult(bridge, {
+      docId: 'doc-1',
+      fileName: 'secret.hwp',
+      sourcePath: '/tmp/secret.hwp',
+      format: 'hwp',
+      pageCount: 1,
+      revision: 1,
+      dirty: false,
+      warnings: [],
+    });
+    bridge.enableCurrentDocumentPasswordProtection();
+
+    const result = await bridge.disableCurrentDocumentPasswordProtection('wrong-password');
+
+    expect(result).toBe('wrong-password');
+    expect(bridge.isCurrentDocumentPasswordProtected()).toBe(true);
+  });
+
+  it('does nothing when disabling password protection on a document that does not have it', async () => {
+    const bridge = new TauriBridge();
+    applyOpenResult(bridge, {
+      docId: 'doc-1',
+      fileName: 'plain.hwp',
+      sourcePath: '/tmp/plain.hwp',
+      format: 'hwp',
+      pageCount: 1,
+      revision: 1,
+      dirty: false,
+      warnings: [],
+    });
+
+    const result = await bridge.disableCurrentDocumentPasswordProtection('irrelevant');
+
+    expect(result).toBe('removed');
+    expect(fsOpenMock).not.toHaveBeenCalled();
   });
 
   it('creates a new native document and releases it if wasm creation fails', async () => {

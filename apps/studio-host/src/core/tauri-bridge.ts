@@ -1,9 +1,9 @@
 import { WasmBridge } from '@/upstream/core';
 import type { DocumentInfo } from '@/upstream/core';
 import { showHwpPasswordDialog, showHwpSavePasswordDialog } from '@/upstream/ui';
+import { HwpDocument } from '@wasm/rhwp.js';
 import { remove, stat } from '@tauri-apps/plugin-fs';
 import { finiteFileSize, readFileInChunks, writeFileInChunks } from './chunked-fs';
-import { shouldEncryptNewSaves } from './save-password-preference';
 
 type DocumentFormat = 'hwp' | 'hwpx';
 
@@ -101,6 +101,8 @@ export interface DesktopLoadPayload {
   message: string;
 }
 
+export type DisablePasswordProtectionResult = 'removed' | 'wrong-password';
+
 export interface DesktopBridgeApi {
   openDocumentFromDialog(): Promise<DesktopLoadPayload | null>;
   openDocumentByPath(path: string): Promise<DesktopLoadPayload | null>;
@@ -123,6 +125,9 @@ export interface DesktopBridgeApi {
   hasUnsavedChanges(): boolean;
   markDocumentDirty(): void;
   confirmWindowClose(): Promise<boolean>;
+  isCurrentDocumentPasswordProtected(): boolean;
+  enableCurrentDocumentPasswordProtection(): void;
+  disableCurrentDocumentPasswordProtection(password: string): Promise<DisablePasswordProtectionResult>;
 }
 
 export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
@@ -181,11 +186,7 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
    */
   private async loadDocumentForOpen(bytes: Uint8Array, fileName: string): Promise<DocumentInfo | null> {
     try {
-      const info = super.loadDocument(bytes, fileName);
-      // 환경설정 > 파일 탭의 "새 문서도 저장할 때 암호 적용"이 켜져 있으면, 원래 암호가
-      // 없던 문서도 이후 저장부터 암호를 묻는다 (golbin/hop#98 후속 요청).
-      if (shouldEncryptNewSaves()) this.requiresPasswordForSave = true;
-      return info;
+      return super.loadDocument(bytes, fileName);
     } catch (error) {
       if (!isPasswordRequiredError(error)) throw error;
       return this.loadPasswordProtectedDocument(bytes, fileName);
@@ -214,6 +215,60 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
     }
   }
 
+  /**
+   * 환경 설정 > 파일 탭의 보안 체크박스가 현재 문서 상태를 그대로 보여줄 수 있도록 노출한다
+   * (golbin/hop#98 후속 요청). "다음 저장부터 암호를 건다/걸지 않는다"는 in-memory 플래그일 뿐,
+   * 이 호출 자체는 디스크를 건드리지 않는다.
+   */
+  isCurrentDocumentPasswordProtected(): boolean {
+    return this.requiresPasswordForSave;
+  }
+
+  /** 다음 저장부터 암호를 묻는다. 실제 새 암호는 저장 시점에 입력받는다(기존 흐름 재사용). */
+  enableCurrentDocumentPasswordProtection(): void {
+    if (this.requiresPasswordForSave) return;
+    this.requiresPasswordForSave = true;
+    this.markDocumentDirty();
+  }
+
+  /**
+   * 다음 저장부터 암호를 걸지 않는다. 디스크에 이미 암호로 저장된 내용이 있으면(sourcePath),
+   * 그 파일을 입력받은 암호로 실제로 열어볼 수 있는지 확인한 뒤에만 해제한다 — 자리를 비운
+   * 사이 환경설정에서 암호를 그냥 꺼버리는 것을 막기 위함이다.
+   *
+   * 검증은 현재 편집 중인 in-memory 문서(this.doc)를 건드리지 않는다. WasmBridge의
+   * loadDocumentWithPassword()를 쓰면 검증 성공 시 그 결과가 this.doc으로 스왑돼 들어가면서
+   * 저장하지 않은 편집 내용이 날아가므로, 대신 HwpDocument.openWithPassword()를 직접 호출해
+   * 1회용 인스턴스로만 검증하고 바로 해제(free)한다.
+   */
+  async disableCurrentDocumentPasswordProtection(password: string): Promise<DisablePasswordProtectionResult> {
+    if (!this.requiresPasswordForSave) return 'removed';
+
+    if (!this.sourcePath) {
+      // 저장된 적 없는 새 문서 — 디스크에 검증할 암호 문서 자체가 없으므로 바로 해제한다.
+      this.requiresPasswordForSave = false;
+      this.markDocumentDirty();
+      return 'removed';
+    }
+
+    const { bytes } = await readFileInChunks(this.sourcePath);
+    let probe: HwpDocument | null = null;
+    try {
+      // 문서가 이미 암호 없이 저장돼 있으면(예: 체크 후 저장 전에 다시 해제하는 경우) rhwp는
+      // 전달한 암호를 그냥 무시하고 성공한다 — 검증할 게 없으니 그대로 해제를 진행해도 안전하다.
+      probe = HwpDocument.openWithPassword(bytes, password);
+    } catch (error) {
+      if (isPasswordRejectedError(error)) return 'wrong-password';
+      throw error;
+    } finally {
+      probe?.free();
+    }
+
+    this.requiresPasswordForSave = false;
+    this.markDocumentDirty();
+    return 'removed';
+  }
+
   async takePendingOpenPaths(): Promise<string[]> {
     return this.invoke<string[]>('take_pending_open_paths');
   }
@@ -225,7 +280,6 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
     const previousDocId = this.docId;
     try {
       const info = super.createNewDocument();
-      if (shouldEncryptNewSaves()) this.requiresPasswordForSave = true;
       this.applyNativeOpenResult(result);
       await this.closeReplacedDocument(previousDocId, result.docId);
       return {

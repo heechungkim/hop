@@ -2,11 +2,13 @@
  * 환경 설정 대화상자 (도구 > 환경 설정)
  *
  * upstream rhwp-studio의 OptionsDialog를 포크한 사본이다 (golbin/hop#98 후속 요청).
- * 한글과 달리 이 앱에는 "암호로 저장" 메뉴가 없어서, "파일" 탭에 "새 문서도 저장할 때
- * 암호 적용" 체크박스를 추가했다 — 켜져 있으면 TauriBridge가 문서를 열거나 새로 만들 때
- * requiresPasswordForSave를 강제로 켜서, 이미 구현된 저장 시 암호 재입력 흐름을 그대로 탄다.
- * 그 외 로직은 upstream과 동일하다. upstream이 이 파일을 바꾸면 수동으로 재동기화해야 한다
- * (config/rhwp-studio-overrides.json의 counterparts 해시로 드리프트를 감지한다).
+ * 한글과 달리 이 앱에는 "암호로 저장" 메뉴가 없어서, "파일" 탭에 현재 문서의 암호 보호
+ * 여부를 그대로 보여주고 켜고 끌 수 있는 "보안" 체크박스를 추가했다. 다른 설정과 달리
+ * 확인 버튼을 눌러야 반영되는 게 아니라, 체크박스를 누르는 즉시 적용된다 — 암호 해제는
+ * 되돌릴 수 없는 조작이라 "확인/취소"로 묶기보다 그 자리에서 바로 처리하고 검증하는 편이
+ * 안전하다. 그 외 로직은 upstream과 동일하다. upstream이 이 파일을 바꾸면 수동으로
+ * 재동기화해야 한다 (config/rhwp-studio-overrides.json의 counterparts 해시로 드리프트를
+ * 감지한다).
  *
  * 탭 구조: [글꼴] [파일]
  */
@@ -22,7 +24,14 @@ import {
   loadStoredLocalFonts,
   type LocalFontState,
 } from '@/core/local-fonts';
-import { setEncryptNewSaves, shouldEncryptNewSaves } from '../core/save-password-preference';
+import { showConfirmPasswordDialog } from './confirm-password-dialog';
+
+export interface DocumentPasswordSecurity {
+  fileName: string;
+  isCurrentDocumentPasswordProtected(): boolean;
+  enableCurrentDocumentPasswordProtection(): void;
+  disableCurrentDocumentPasswordProtection(password: string): Promise<'removed' | 'wrong-password'>;
+}
 
 export class OptionsDialog extends ModalDialog {
   private showRecentCheck!: HTMLInputElement;
@@ -32,9 +41,11 @@ export class OptionsDialog extends ModalDialog {
   private idleSaveEnabledCheck!: HTMLInputElement;
   private idleDelayInput!: HTMLInputElement;
   private pdfPrintGuidanceCheck!: HTMLInputElement;
-  private encryptNewSavesCheck!: HTMLInputElement;
 
-  constructor(private readonly eventBus?: EventBus) {
+  constructor(
+    private readonly passwordSecurity: DocumentPasswordSecurity | null,
+    private readonly eventBus?: EventBus,
+  ) {
     super('환경 설정', 480);
   }
 
@@ -337,38 +348,100 @@ export class OptionsDialog extends ModalDialog {
     pdfSection.appendChild(pdfRow);
     panel.appendChild(pdfSection);
 
-    const securitySection = document.createElement('div');
-    securitySection.className = 'dialog-section';
-
-    const securityTitle = document.createElement('div');
-    securityTitle.className = 'dialog-section-title';
-    securityTitle.textContent = '보안';
-    securitySection.appendChild(securityTitle);
-
-    const securityDesc = document.createElement('p');
-    securityDesc.className = 'opt-desc';
-    securityDesc.textContent =
-      '켜두면 암호가 없던 문서를 새로 저장할 때도 암호 입력창이 뜨고, 입력한 암호로 저장됩니다. '
-      + '이미 암호가 걸린 문서는 이 설정과 상관없이 항상 저장 시 암호를 다시 물어봅니다.';
-    securitySection.appendChild(securityDesc);
-
-    const securityRow = document.createElement('div');
-    securityRow.className = 'dialog-row opt-row';
-
-    this.encryptNewSavesCheck = document.createElement('input');
-    this.encryptNewSavesCheck.type = 'checkbox';
-    this.encryptNewSavesCheck.id = 'opt-encrypt-new-saves';
-    this.encryptNewSavesCheck.checked = shouldEncryptNewSaves();
-
-    const securityLabel = document.createElement('label');
-    securityLabel.htmlFor = 'opt-encrypt-new-saves';
-    securityLabel.textContent = '새 문서도 저장할 때 암호 적용';
-
-    securityRow.append(this.encryptNewSavesCheck, securityLabel);
-    securitySection.appendChild(securityRow);
-    panel.appendChild(securitySection);
+    if (this.passwordSecurity) {
+      panel.appendChild(this.createSecuritySection(this.passwordSecurity));
+    }
 
     return panel;
+  }
+
+  /**
+   * 체크박스는 확인 버튼을 기다리지 않고 누르는 즉시 반영된다 — 암호 해제는 검증이 필요한
+   * 조작이라 다른 설정과 같은 "확인/취소" 배치 커밋에 묶기보다 그 자리에서 바로 처리한다.
+   */
+  private createSecuritySection(security: DocumentPasswordSecurity): HTMLElement {
+    const section = document.createElement('div');
+    section.className = 'dialog-section';
+
+    const title = document.createElement('div');
+    title.className = 'dialog-section-title';
+    title.textContent = '보안';
+    section.appendChild(title);
+
+    const desc = document.createElement('p');
+    desc.className = 'opt-desc';
+    desc.textContent =
+      '현재 문서의 암호 보호 여부입니다. 켜면 다음 저장부터 새 암호를 입력받아 적용하고, '
+      + '끄면 현재 암호를 확인한 뒤 다음 저장부터 암호 없이 저장합니다. 지금 껐다 켜는 것만으로는 '
+      + '아무것도 저장되지 않으며, 실제 반영에는 저장이 필요합니다.';
+    section.appendChild(desc);
+
+    const errorText = document.createElement('p');
+    errorText.setAttribute('role', 'alert');
+    errorText.hidden = true;
+    section.appendChild(errorText);
+
+    const row = document.createElement('div');
+    row.className = 'dialog-row opt-row';
+
+    const check = document.createElement('input');
+    check.type = 'checkbox';
+    check.id = 'opt-current-document-password';
+    check.checked = security.isCurrentDocumentPasswordProtected();
+
+    const label = document.createElement('label');
+    label.htmlFor = 'opt-current-document-password';
+    label.textContent = '이 문서를 암호로 보호';
+
+    check.addEventListener('change', () => {
+      if (check.checked) {
+        errorText.hidden = true;
+        security.enableCurrentDocumentPasswordProtection();
+        return;
+      }
+      void this.handleDisablePasswordProtection(security, check, errorText);
+    });
+
+    row.append(check, label);
+    section.appendChild(row);
+
+    return section;
+  }
+
+  private async handleDisablePasswordProtection(
+    security: DocumentPasswordSecurity,
+    check: HTMLInputElement,
+    errorText: HTMLParagraphElement,
+  ): Promise<void> {
+    check.disabled = true;
+    let retryMessage: string | undefined;
+
+    try {
+      while (true) {
+        const password = await showConfirmPasswordDialog(security.fileName, retryMessage);
+        if (password === null) {
+          // 사용자가 취소함 — 체크박스를 원래 상태(보호됨)로 되돌린다.
+          check.checked = true;
+          errorText.hidden = true;
+          return;
+        }
+
+        const result = await security.disableCurrentDocumentPasswordProtection(password);
+        if (result === 'wrong-password') {
+          retryMessage = '암호가 일치하지 않습니다. 다시 입력하세요.';
+          continue;
+        }
+
+        errorText.hidden = true;
+        return;
+      }
+    } catch (error) {
+      check.checked = true;
+      errorText.textContent = `암호 해제에 실패했습니다: ${error instanceof Error ? error.message : String(error)}`;
+      errorText.hidden = false;
+    } finally {
+      check.disabled = false;
+    }
   }
 
   protected onConfirm(): void {
@@ -384,7 +457,6 @@ export class OptionsDialog extends ModalDialog {
       idleDelaySeconds: clampInteger(this.idleDelayInput.value, 10, 5, 600),
     });
     userSettings.setShowPdfPrintGuidance(this.pdfPrintGuidanceCheck.checked);
-    setEncryptNewSaves(this.encryptNewSavesCheck.checked);
     this.eventBus?.emit('autosave-settings-changed', { source: 'options-dialog' });
   }
 }
