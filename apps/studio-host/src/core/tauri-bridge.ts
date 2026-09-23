@@ -1,6 +1,6 @@
 import { WasmBridge } from '@/upstream/core';
 import type { DocumentInfo } from '@/upstream/core';
-import { showHwpPasswordDialog } from '@/upstream/ui';
+import { showHwpPasswordDialog, showHwpSavePasswordDialog } from '@/upstream/ui';
 import { remove, stat } from '@tauri-apps/plugin-fs';
 import { finiteFileSize, readFileInChunks, writeFileInChunks } from './chunked-fs';
 
@@ -31,6 +31,8 @@ function passwordOpenFailure(error: unknown): Error {
   if (message.includes('DRM')) {
     return new Error('DRM으로 보호된 문서는 지원하지 않습니다.');
   }
+  // 화면에는 안전한 일반 안내만 보여주지만, 진단을 위해 원본 오류는 devtools 콘솔에 남긴다.
+  console.warn('[tauri-bridge] 암호 문서 열기 실패 원인:', message);
   return new Error('암호화된 문서를 열 수 없습니다. 문서가 손상되었는지 확인하세요.');
 }
 
@@ -193,7 +195,10 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
       if (password === null) return null;
 
       try {
-        return super.loadDocumentWithPassword(bytes, password, fileName);
+        const info = super.loadDocumentWithPassword(bytes, password, fileName);
+        // 암호로 연 문서는 재저장할 때도 같은 보호가 유지돼야 한다 (golbin/hop#98 후속 요청).
+        this.requiresPasswordForSave = true;
+        return info;
       } catch (error) {
         if (isPasswordRejectedError(error)) {
           retryMessage = '암호가 일치하지 않거나 문서가 손상되었습니다. 다시 입력하세요.';
@@ -404,7 +409,8 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
 
     const stagedPath = await this.invoke<string>('prepare_staged_hwp_save', { targetPath: finalPath });
     try {
-      await this.writeCurrentHwpToPath(stagedPath);
+      const wrote = await this.writeCurrentHwpToPathForSave(stagedPath);
+      if (!wrote) return null;
       const result = await this.invoke<DesktopSaveResult>('commit_staged_hwp_save', {
         docId,
         stagedPath,
@@ -512,6 +518,30 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
 
   private async writeCurrentHwpToPath(path: string): Promise<void> {
     await writeFileInChunks(path, super.exportHwp());
+  }
+
+  /**
+   * 저장 전용 export다. 암호로 열었던 문서는 저장할 때도 암호를 다시 걸어야 한다
+   * (golbin/hop#98 후속 요청). PDF 내보내기 등 다른 staging 경로는 암호 없는
+   * writeCurrentHwpToPath()를 그대로 쓴다 — 변환 파이프라인이 암호 문서를 못 읽는다.
+   * 저장마다 암호를 다시 입력받고 즉시 폐기한다(메모리에 보관하지 않음, upstream main.ts와 동일 정책).
+   * 사용자가 암호 입력을 취소하면 false를 반환해 저장 자체를 취소한다.
+   */
+  private async writeCurrentHwpToPathForSave(path: string): Promise<boolean> {
+    if (!this.requiresPasswordForSave) {
+      await this.writeCurrentHwpToPath(path);
+      return true;
+    }
+
+    let password = await showHwpSavePasswordDialog(this.fileName);
+    if (password === null) return false;
+
+    try {
+      await writeFileInChunks(path, super.exportHwpWithPassword(password));
+      return true;
+    } finally {
+      password = '';
+    }
   }
 
   private withExtension(path: string, extension: string): string {

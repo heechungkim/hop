@@ -10,6 +10,7 @@ const fsOpenMock = vi.hoisted(() => vi.fn());
 const statMock = vi.hoisted(() => vi.fn());
 const removeMock = vi.hoisted(() => vi.fn());
 const passwordDialogMock = vi.hoisted(() => vi.fn());
+const savePasswordDialogMock = vi.hoisted(() => vi.fn());
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: invokeMock,
@@ -29,6 +30,7 @@ vi.mock('@tauri-apps/plugin-fs', () => ({
 
 vi.mock('@/ui/hwp-password-dialog', () => ({
   showHwpPasswordDialog: passwordDialogMock,
+  showHwpSavePasswordDialog: savePasswordDialogMock,
 }));
 
 vi.mock('@/core/wasm-bridge', () => ({
@@ -44,7 +46,9 @@ vi.mock('@/core/wasm-bridge', () => ({
     }));
     createNewDocumentMock = vi.fn(() => ({ pageCount: 1, fontsUsed: [] }));
     exportHwpMock = vi.fn(() => new Uint8Array([1, 2, 3]));
+    exportHwpWithPasswordMock = vi.fn((_password: string) => new Uint8Array([9, 8, 7]));
     sourceFormat = 'hwp';
+    requiresPasswordForSave = false;
 
     loadDocument(bytes: Uint8Array, fileName: string) {
       this.sourceFormat = fileName.endsWith('.hwpx') || bytes[0] === 0x50 ? 'hwpx' : 'hwp';
@@ -62,6 +66,10 @@ vi.mock('@/core/wasm-bridge', () => ({
 
     exportHwp() {
       return this.exportHwpMock();
+    }
+
+    exportHwpWithPassword(password: string) {
+      return this.exportHwpWithPasswordMock(password);
     }
 
     getSourceFormat() {
@@ -324,6 +332,90 @@ describe('TauriBridge', () => {
     );
 
     expect(invokeMock).toHaveBeenCalledWith('close_document', { docId: 'drm-doc' });
+  });
+
+  it('re-encrypts on save a document that was opened with a password', async () => {
+    const bridge = new TauriBridge();
+    const handle = writeHandle();
+    fsOpenMock
+      .mockResolvedValueOnce(readHandle([1, 2, 3]))
+      .mockResolvedValueOnce(handle);
+    statMock.mockResolvedValue({ size: 3, isFile: true, mtime: new Date('2026-04-23T00:00:00.000Z') });
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === 'prepare_document_open') return undefined;
+      if (command === 'open_document_tracking') {
+        return nativeOpenResult({
+          docId: 'secret-doc',
+          fileName: 'secret.hwp',
+          sourcePath: '/tmp/secret.hwp',
+          revision: 3,
+        });
+      }
+      if (command === 'note_finder_recent_document') return undefined;
+      if (command === 'record_recent_document') return undefined;
+      if (command === 'check_external_modification') return { changed: false };
+      if (command === 'prepare_staged_hwp_save') return '/tmp/secret.hwp.hop-save-xyz.tmp';
+      if (command === 'commit_staged_hwp_save') {
+        return {
+          docId: 'secret-doc',
+          sourcePath: '/tmp/secret.hwp',
+          format: 'hwp',
+          revision: 4,
+          dirty: false,
+          warnings: [],
+        };
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+    getWasmMock(bridge, 'loadDocumentMock').mockImplementationOnce(() => {
+      throw new Error('유효하지 않은 파일: 비밀번호가 필요한 암호 문서입니다');
+    });
+    passwordDialogMock.mockResolvedValueOnce('open-password');
+
+    await bridge.openDocumentByPath('/tmp/secret.hwp');
+
+    savePasswordDialogMock.mockResolvedValueOnce('save-password');
+    const result = await bridge.saveDocumentFromCommand();
+
+    expect(savePasswordDialogMock).toHaveBeenCalledWith('secret.hwp');
+    expect(getWasmMock(bridge, 'exportHwpWithPasswordMock')).toHaveBeenCalledWith('save-password');
+    expect(getWasmMock(bridge, 'exportHwpMock')).not.toHaveBeenCalled();
+    expect(handle.write).toHaveBeenCalledWith(new Uint8Array([9, 8, 7]));
+    expect(result?.revision).toBe(4);
+  });
+
+  it('cancels the save when the save-password prompt is cancelled', async () => {
+    const bridge = new TauriBridge();
+    fsOpenMock.mockResolvedValueOnce(readHandle([1, 2, 3]));
+    statMock.mockResolvedValue({ size: 3, isFile: true, mtime: new Date('2026-04-23T00:00:00.000Z') });
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === 'prepare_document_open') return undefined;
+      if (command === 'open_document_tracking') {
+        return nativeOpenResult({
+          docId: 'secret-doc',
+          fileName: 'secret.hwp',
+          sourcePath: '/tmp/secret.hwp',
+        });
+      }
+      if (command === 'note_finder_recent_document') return undefined;
+      if (command === 'record_recent_document') return undefined;
+      if (command === 'check_external_modification') return { changed: false };
+      if (command === 'prepare_staged_hwp_save') return '/tmp/secret.hwp.hop-save-xyz.tmp';
+      throw new Error(`unexpected command ${command}`);
+    });
+    getWasmMock(bridge, 'loadDocumentMock').mockImplementationOnce(() => {
+      throw new Error('유효하지 않은 파일: 비밀번호가 필요한 암호 문서입니다');
+    });
+    passwordDialogMock.mockResolvedValueOnce('open-password');
+
+    await bridge.openDocumentByPath('/tmp/secret.hwp');
+
+    savePasswordDialogMock.mockResolvedValueOnce(null);
+    const result = await bridge.saveDocumentFromCommand();
+
+    expect(result).toBeNull();
+    expect(invokeMock).not.toHaveBeenCalledWith('commit_staged_hwp_save', expect.anything());
+    expect(getWasmMock(bridge, 'exportHwpWithPasswordMock')).not.toHaveBeenCalled();
   });
 
   it('creates a new native document and releases it if wasm creation fails', async () => {
@@ -803,7 +895,12 @@ function nativeOpenResult(overrides: Record<string, unknown> = {}) {
 
 function getWasmMock(
   bridge: TauriBridge,
-  name: 'loadDocumentMock' | 'loadDocumentWithPasswordMock' | 'createNewDocumentMock' | 'exportHwpMock',
+  name:
+    | 'loadDocumentMock'
+    | 'loadDocumentWithPasswordMock'
+    | 'createNewDocumentMock'
+    | 'exportHwpMock'
+    | 'exportHwpWithPasswordMock',
 ) {
   return (bridge as unknown as Record<typeof name, ReturnType<typeof vi.fn>>)[name];
 }
