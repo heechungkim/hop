@@ -3,6 +3,7 @@ import type { DocumentInfo } from '@/upstream/core';
 import { showHwpPasswordDialog, showHwpSavePasswordDialog } from '@/upstream/ui';
 import { remove, stat } from '@tauri-apps/plugin-fs';
 import { finiteFileSize, readFileInChunks, writeFileInChunks } from './chunked-fs';
+import { shouldEncryptNewSaves } from './save-password-preference';
 
 type DocumentFormat = 'hwp' | 'hwpx';
 
@@ -180,7 +181,11 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
    */
   private async loadDocumentForOpen(bytes: Uint8Array, fileName: string): Promise<DocumentInfo | null> {
     try {
-      return super.loadDocument(bytes, fileName);
+      const info = super.loadDocument(bytes, fileName);
+      // 환경설정 > 파일 탭의 "새 문서도 저장할 때 암호 적용"이 켜져 있으면, 원래 암호가
+      // 없던 문서도 이후 저장부터 암호를 묻는다 (golbin/hop#98 후속 요청).
+      if (shouldEncryptNewSaves()) this.requiresPasswordForSave = true;
+      return info;
     } catch (error) {
       if (!isPasswordRequiredError(error)) throw error;
       return this.loadPasswordProtectedDocument(bytes, fileName);
@@ -220,6 +225,7 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
     const previousDocId = this.docId;
     try {
       const info = super.createNewDocument();
+      if (shouldEncryptNewSaves()) this.requiresPasswordForSave = true;
       this.applyNativeOpenResult(result);
       await this.closeReplacedDocument(previousDocId, result.docId);
       return {

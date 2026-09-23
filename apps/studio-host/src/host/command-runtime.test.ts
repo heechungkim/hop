@@ -13,11 +13,11 @@ vi.mock('@/upstream/commands', () => ({
   insertCommands: [],
   pageCommands: [],
   tableCommands: [],
-  toolCommands: [],
   viewCommands: [],
 }));
 vi.mock('@/command/commands/edit', () => ({ editCommands: [] }));
 vi.mock('@/command/commands/file', () => ({ fileCommands: [] }));
+vi.mock('@/command/commands/tool', () => ({ toolCommands: [] }));
 
 import { createCommandRuntime } from './command-runtime';
 

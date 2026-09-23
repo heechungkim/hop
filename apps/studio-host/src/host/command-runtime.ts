@@ -7,13 +7,13 @@ import {
   insertCommands,
   pageCommands,
   tableCommands,
-  toolCommands,
   viewCommands,
 } from '@/upstream/commands';
 import type { CommandDef, CommandServices, EditorContext, EditorEditMode } from '@/upstream/commands';
 import type { DocumentDirtyState, EventBus, WasmBridge } from '@/upstream/core';
 import { editCommands } from '@/command/commands/edit';
 import { fileCommands } from '@/command/commands/file';
+import { toolCommands } from '@/command/commands/tool';
 import { assertUniqueCommandIds } from '../command/replace-upstream-commands';
 
 interface CommandRuntimeDependencies {

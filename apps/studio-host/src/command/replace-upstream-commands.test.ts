@@ -6,11 +6,11 @@ import {
   formatCommands,
   pageCommands,
   tableCommands,
-  toolCommands,
   viewCommands,
 } from '@/upstream/commands';
 import { editCommands } from './commands/edit';
 import { fileCommands } from './commands/file';
+import { toolCommands } from './commands/tool';
 import { assertUniqueCommandIds, replaceUpstreamCommands } from './replace-upstream-commands';
 import { defaultShortcuts } from './shortcut-map';
 

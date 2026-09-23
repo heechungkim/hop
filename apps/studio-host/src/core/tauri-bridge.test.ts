@@ -11,6 +11,7 @@ const statMock = vi.hoisted(() => vi.fn());
 const removeMock = vi.hoisted(() => vi.fn());
 const passwordDialogMock = vi.hoisted(() => vi.fn());
 const savePasswordDialogMock = vi.hoisted(() => vi.fn());
+const shouldEncryptNewSavesMock = vi.hoisted(() => vi.fn(() => false));
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: invokeMock,
@@ -31,6 +32,10 @@ vi.mock('@tauri-apps/plugin-fs', () => ({
 vi.mock('@/ui/hwp-password-dialog', () => ({
   showHwpPasswordDialog: passwordDialogMock,
   showHwpSavePasswordDialog: savePasswordDialogMock,
+}));
+
+vi.mock('./save-password-preference', () => ({
+  shouldEncryptNewSaves: shouldEncryptNewSavesMock,
 }));
 
 vi.mock('@/core/wasm-bridge', () => ({
@@ -84,6 +89,7 @@ describe('TauriBridge', () => {
     (globalThis as { document?: { title: string } }).document = { title: '' };
     statMock.mockResolvedValue({ size: 3, isFile: true, mtime: new Date('2026-04-23T00:00:00.000Z') });
     removeMock.mockResolvedValue(undefined);
+    shouldEncryptNewSavesMock.mockReturnValue(false);
   });
 
   it('opens a native document by path, mirrors bytes into wasm, and updates title state', async () => {
@@ -332,6 +338,40 @@ describe('TauriBridge', () => {
     );
 
     expect(invokeMock).toHaveBeenCalledWith('close_document', { docId: 'drm-doc' });
+  });
+
+  it('requires a save password for a newly opened plain document when the "encrypt new saves" preference is on', async () => {
+    const bridge = new TauriBridge();
+    fsOpenMock.mockResolvedValue(readHandle([1, 2, 3]));
+    invokeMock.mockResolvedValue(nativeOpenResult({ docId: 'plain-doc', fileName: 'plain.hwp' }));
+    shouldEncryptNewSavesMock.mockReturnValue(true);
+
+    await bridge.openDocumentByPath('/tmp/plain.hwp');
+
+    expect(getRequiresPasswordForSave(bridge)).toBe(true);
+  });
+
+  it('does not require a save password for a newly opened document when the preference is off', async () => {
+    const bridge = new TauriBridge();
+    fsOpenMock.mockResolvedValue(readHandle([1, 2, 3]));
+    invokeMock.mockResolvedValue(nativeOpenResult({ docId: 'plain-doc', fileName: 'plain.hwp' }));
+
+    await bridge.openDocumentByPath('/tmp/plain.hwp');
+
+    expect(getRequiresPasswordForSave(bridge)).toBe(false);
+  });
+
+  it('requires a save password for a newly created document when the "encrypt new saves" preference is on', async () => {
+    const bridge = new TauriBridge();
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === 'create_document') return nativeOpenResult({ docId: 'new-doc' });
+      throw new Error(`unexpected command ${command}`);
+    });
+    shouldEncryptNewSavesMock.mockReturnValue(true);
+
+    await bridge.createNewDocumentAsync();
+
+    expect(getRequiresPasswordForSave(bridge)).toBe(true);
   });
 
   it('re-encrypts on save a document that was opened with a password', async () => {
@@ -905,4 +945,8 @@ function getWasmMock(
     | 'exportHwpWithPasswordMock',
 ) {
   return (bridge as unknown as Record<typeof name, ReturnType<typeof vi.fn>>)[name];
+}
+
+function getRequiresPasswordForSave(bridge: TauriBridge): boolean {
+  return (bridge as unknown as { requiresPasswordForSave: boolean }).requiresPasswordForSave;
 }
