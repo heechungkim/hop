@@ -341,7 +341,7 @@ describe('TauriBridge', () => {
       .mockResolvedValueOnce(readHandle([1, 2, 3]))
       .mockResolvedValueOnce(handle);
     statMock.mockResolvedValue({ size: 3, isFile: true, mtime: new Date('2026-04-23T00:00:00.000Z') });
-    invokeMock.mockImplementation(async (command: string) => {
+    invokeMock.mockImplementation(async (command: string, args: Record<string, unknown>) => {
       if (command === 'prepare_document_open') return undefined;
       if (command === 'open_document_tracking') {
         return nativeOpenResult({
@@ -356,6 +356,7 @@ describe('TauriBridge', () => {
       if (command === 'check_external_modification') return { changed: false };
       if (command === 'prepare_staged_hwp_save') return '/tmp/secret.hwp.hop-save-xyz.tmp';
       if (command === 'commit_staged_hwp_save') {
+        expect(args).toMatchObject({ password: 'save-password' });
         return {
           docId: 'secret-doc',
           sourcePath: '/tmp/secret.hwp',
@@ -603,6 +604,7 @@ describe('TauriBridge', () => {
           targetPath: '/tmp/report.hwp',
           expectedRevision: 5,
           allowExternalOverwrite: false,
+          password: null,
         });
         return {
           docId: 'doc-1',

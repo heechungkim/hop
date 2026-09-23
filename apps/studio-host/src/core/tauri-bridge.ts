@@ -408,20 +408,24 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
     if (allowExternalOverwrite === null) return null;
 
     const stagedPath = await this.invoke<string>('prepare_staged_hwp_save', { targetPath: finalPath });
+    let password: string | null = null;
     try {
-      const wrote = await this.writeCurrentHwpToPathForSave(stagedPath);
-      if (!wrote) return null;
+      const written = await this.writeCurrentHwpToPathForSave(stagedPath);
+      if (written === 'cancelled') return null;
+      password = written.password;
       const result = await this.invoke<DesktopSaveResult>('commit_staged_hwp_save', {
         docId,
         stagedPath,
         targetPath: finalPath,
         expectedRevision: this.revision,
         allowExternalOverwrite,
+        password,
       });
       this.applyNativeSaveResult(result);
       await this.noteFinderRecentDocument(finalPath);
       return result;
     } finally {
+      password = null;
       await remove(stagedPath).catch(() => undefined);
     }
   }
@@ -524,24 +528,23 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
    * 저장 전용 export다. 암호로 열었던 문서는 저장할 때도 암호를 다시 걸어야 한다
    * (golbin/hop#98 후속 요청). PDF 내보내기 등 다른 staging 경로는 암호 없는
    * writeCurrentHwpToPath()를 그대로 쓴다 — 변환 파이프라인이 암호 문서를 못 읽는다.
-   * 저장마다 암호를 다시 입력받고 즉시 폐기한다(메모리에 보관하지 않음, upstream main.ts와 동일 정책).
-   * 사용자가 암호 입력을 취소하면 false를 반환해 저장 자체를 취소한다.
+   * 저장마다 암호를 다시 입력받는다(메모리에 보관하지 않음, upstream main.ts와 동일 정책).
+   * 반환한 password는 commit_staged_hwp_save가 staging 바이트를 같은 암호로 재검증하는 데
+   * 쓰인다 — 그러지 않으면 방금 암호화한 파일을 암호 없이 재파싱하려다 저장이 실패한다.
+   * 호출자가 사용을 마치는 즉시 폐기해야 한다. 사용자가 암호 입력을 취소하면
+   * 'cancelled'를 반환해 저장 자체를 취소한다.
    */
-  private async writeCurrentHwpToPathForSave(path: string): Promise<boolean> {
+  private async writeCurrentHwpToPathForSave(path: string): Promise<{ password: string | null } | 'cancelled'> {
     if (!this.requiresPasswordForSave) {
       await this.writeCurrentHwpToPath(path);
-      return true;
+      return { password: null };
     }
 
-    let password = await showHwpSavePasswordDialog(this.fileName);
-    if (password === null) return false;
+    const password = await showHwpSavePasswordDialog(this.fileName);
+    if (password === null) return 'cancelled';
 
-    try {
-      await writeFileInChunks(path, super.exportHwpWithPassword(password));
-      return true;
-    } finally {
-      password = '';
-    }
+    await writeFileInChunks(path, super.exportHwpWithPassword(password));
+    return { password };
   }
 
   private withExtension(path: string, extension: string): string {

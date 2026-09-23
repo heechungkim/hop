@@ -108,6 +108,9 @@ pub fn prepare_staged_hwp_pdf_export(
     )
 }
 
+// Tauri command params map 1:1 to the frontend's flat invoke() payload keys, so this
+// stays flat rather than introducing a wrapper struct just for arg count.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub fn commit_staged_hwp_save(
     app: AppHandle,
@@ -116,6 +119,7 @@ pub fn commit_staged_hwp_save(
     target_path: String,
     expected_revision: Option<u64>,
     allow_external_overwrite: Option<bool>,
+    password: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<SaveResult, String> {
     let target_path = PathBuf::from(target_path);
@@ -129,6 +133,7 @@ pub fn commit_staged_hwp_save(
             target_path.clone(),
             expected_revision,
             allow_external_overwrite.unwrap_or(false),
+            password.as_deref(),
         )?;
     let _ = recent_documents::record_document(&app, &target_path);
     Ok(result)
@@ -177,7 +182,7 @@ pub fn render_document_preview(path: String) -> Result<String, String> {
             e
         )
     })?;
-    let core = editable_core_from_bytes(&bytes, "문서 파싱 실패", "미리보기용 문서 변환 실패")?;
+    let core = editable_core_from_bytes(&bytes, None, "문서 파싱 실패", "미리보기용 문서 변환 실패")?;
     core.render_page_svg_native(0)
         .map_err(|e| format!("문서 미리보기를 렌더링할 수 없습니다: {}", e))
 }
@@ -279,6 +284,7 @@ pub fn export_pdf_from_hwp_path(
     })?;
     let core = editable_core_from_bytes(
         &bytes,
+        None,
         "문서 바이트 파싱 실패",
         "PDF 내보내기용 문서 변환 실패",
     )?;

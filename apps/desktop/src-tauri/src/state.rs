@@ -193,6 +193,7 @@ impl DocumentSessionManager {
         target_path: PathBuf,
         expected_revision: Option<u64>,
         allow_external_overwrite: bool,
+        password: Option<&str>,
     ) -> Result<SaveResult, String> {
         let session = self.session_mut(doc_id)?;
         session.check_revision(expected_revision)?;
@@ -213,8 +214,16 @@ impl DocumentSessionManager {
                 e
             )
         })?;
-        let core =
-            editable_core_from_bytes(&bytes, "저장 바이트 검증 실패", "저장 문서 변환 실패")?;
+        // 저장 직전 프론트엔드가 exportHwpWithPassword()로 암호를 다시 걸었다면, staging
+        // 바이트도 같은 암호로 검증해야 한다 (golbin/hop#98 후속). 그러지 않으면 방금 만든
+        // 암호 파일을 암호 없이 재파싱하려다 "비밀번호가 필요한 암호 문서" 오류로 저장 자체가
+        // 실패한다.
+        let core = editable_core_from_bytes(
+            &bytes,
+            password.map(str::as_bytes),
+            "저장 바이트 검증 실패",
+            "저장 문서 변환 실패",
+        )?;
         session.finish_hwp_save(target_path, &bytes, Some(core))?;
         let _ = std::fs::remove_file(&staged_path);
         Ok(session.save_result())
@@ -453,7 +462,7 @@ impl DocumentSession {
                 format!("문서를 읽을 수 없습니다: {} ({})", source_path.display(), e)
             })?;
             let core =
-                editable_core_from_bytes(&bytes, "문서 파싱 실패", "편집 가능 문서 변환 실패")?;
+                editable_core_from_bytes(&bytes, None, "문서 파싱 실패", "편집 가능 문서 변환 실패")?;
             self.page_count = core.page_count();
             self.core = Some(core);
         }
@@ -710,11 +719,15 @@ fn same_path(left: &Path, right: &Path) -> bool {
 
 pub(crate) fn editable_core_from_bytes(
     bytes: &[u8],
+    password: Option<&[u8]>,
     parse_context: &str,
     convert_context: &str,
 ) -> Result<DocumentCore, String> {
-    let mut core =
-        DocumentCore::from_bytes(bytes).map_err(|e| format!("{}: {}", parse_context, e))?;
+    let mut core = match password {
+        Some(password) => DocumentCore::from_bytes_with_password(bytes, password),
+        None => DocumentCore::from_bytes(bytes),
+    }
+    .map_err(|e| format!("{}: {}", parse_context, e))?;
     core.convert_to_editable_native()
         .map_err(|e| format!("{}: {}", convert_context, e))?;
     Ok(core)
@@ -997,6 +1010,7 @@ mod tests {
                 target_path.clone(),
                 Some(opened.revision),
                 false,
+                None,
             )
             .unwrap();
 
@@ -1011,6 +1025,76 @@ mod tests {
             opened.revision + 1
         );
         assert!(!manager.session(&opened.doc_id).unwrap().dirty);
+    }
+
+    #[test]
+    fn commit_staged_hwp_save_verifies_password_protected_staged_bytes() {
+        let mut manager = DocumentSessionManager::default();
+        let opened = manager.create_document().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let staged_path = dir.path().join("save.tmp");
+        let target_path = dir.path().join("saved.hwp");
+
+        let bytes = manager
+            .session_mut(&opened.doc_id)
+            .unwrap()
+            .core
+            .as_mut()
+            .unwrap()
+            .export_hwp_with_adapter_with_password(b"secret1")
+            .unwrap();
+        std::fs::write(&staged_path, &bytes).unwrap();
+
+        let result = manager
+            .commit_staged_hwp_save(
+                &opened.doc_id,
+                staged_path.clone(),
+                target_path.clone(),
+                Some(opened.revision),
+                false,
+                Some("secret1"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            result.source_path.as_deref(),
+            Some(target_path.to_string_lossy().as_ref())
+        );
+        assert_eq!(std::fs::read(&target_path).unwrap(), bytes);
+        assert!(!staged_path.exists());
+    }
+
+    #[test]
+    fn commit_staged_hwp_save_rejects_password_protected_staged_bytes_without_password() {
+        let mut manager = DocumentSessionManager::default();
+        let opened = manager.create_document().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let staged_path = dir.path().join("save.tmp");
+        let target_path = dir.path().join("saved.hwp");
+
+        let bytes = manager
+            .session_mut(&opened.doc_id)
+            .unwrap()
+            .core
+            .as_mut()
+            .unwrap()
+            .export_hwp_with_adapter_with_password(b"secret1")
+            .unwrap();
+        std::fs::write(&staged_path, &bytes).unwrap();
+
+        let error = manager
+            .commit_staged_hwp_save(
+                &opened.doc_id,
+                staged_path.clone(),
+                target_path,
+                Some(opened.revision),
+                false,
+                None,
+            )
+            .unwrap_err();
+
+        assert!(error.contains("저장 바이트 검증 실패"));
+        assert!(staged_path.exists());
     }
 
     #[test]
@@ -1030,6 +1114,7 @@ mod tests {
                 target_path,
                 Some(opened.revision),
                 false,
+                None,
             )
             .unwrap_err();
 
